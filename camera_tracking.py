@@ -1,4 +1,3 @@
-# track_water_level_box.py
 import cv2
 import numpy as np
 import argparse
@@ -35,7 +34,7 @@ def parse_args():
     p.add_argument("--select-roi", action="store_true",
                    help="Interactively select MAIN ROI on a chosen (rotated) frame.")
     p.add_argument("--roi-select-scale", type=float, default=1.0,
-                   help="Scale factor for MAIN ROI selection window only (e.g. 0.5 to fit tall videos).")
+                   help="Extra scale factor for MAIN ROI selection window only (multiplies preview scale).")
 
     # Use any frame for selections
     p.add_argument("--select-at-frame", type=int, default=-1,
@@ -125,9 +124,12 @@ def parse_args():
 
     # Output / preview
     p.add_argument("--display", action="store_true", help="Show main annotated window.")
-    p.add_argument("--resize", type=int, nargs=2, metavar=("W","H"), help="Preview resize (overrides --display-scale).")
+    p.add_argument("--resize", type=int, nargs=2, metavar=("W","H"),
+                   help="Preview resize in pixels (overrides --resize-scale and --display-scale).")
+    p.add_argument("--resize-scale", type=float, default=None,
+                   help="Uniform preview scale factor. Example: 0.5 halves size, 1.5 enlarges. Overrides --display-scale. Also applies to selection previews.")
     p.add_argument("--display-scale", type=float, default=1.0,
-                   help="Uniform scale factor for preview windows (overlay, filter, 7seg debug). 0.5 halves size, 1.5 enlarges.")
+                   help="Uniform scale factor for preview windows (overlay, filter, 7seg debug).")
     p.add_argument("--show-filter", action="store_true",
                    help="Show separate window preview of the actual mask used (within MAIN ROI).")
     p.add_argument("--csv", type=Path, default=None,
@@ -512,13 +514,6 @@ def get_seg_boxes(W, H):
     }
 
 def segments_from_digit(mask_digit, on_thresh=0.40, off_thresh=None, prev_pattern=None):
-    """
-    Hysteresis per segment:
-      - ON if lit_frac >= on_thresh
-      - OFF if lit_frac <= off_thresh
-      - else keep previous bit (if prev_pattern provided), else OFF
-    Returns bit pattern (a..g -> bits 0..6).
-    """
     H, W = mask_digit.shape[:2]
     seg_boxes = get_seg_boxes(W, H)
 
@@ -549,9 +544,8 @@ def segments_from_digit(mask_digit, on_thresh=0.40, off_thresh=None, prev_patter
     return pattern
 
 def pattern_to_digit(pattern, tolerate_hamming=1):
-    """Return digit for a 7-seg bit pattern. 0 => blank (None)."""
     if pattern == 0:
-        return None  # explicit blank
+        return None
     for d, p in SEG_PATTERNS.items():
         if p == pattern:
             return d
@@ -568,15 +562,6 @@ def read_digits_from_roi(bgr, expected_n=0, mode="auto", s_min=120, v_min=80,
                          r_open=1, r_close=1, min_intensity=0,
                          allow_fewer=False,
                          prev_patterns=None, seg_off_thresh=None, seg_hyst=0.10):
-    """
-    When expected_n>0:
-      - Always use fixed equal-width slices.
-      - If allow_fewer=True: permit leading blanks only; drop them when assembling.
-        Internal blanks after the first digit cause a FAIL (safer than guessing).
-      - If allow_fewer=False: every slice must decode (no blanks).
-    When expected_n==0: auto-split (legacy behavior).
-    Returns (value, mask, boxes, patterns_now)
-    """
     mask = hsv_mask_for_digits(bgr, mode, s_min, v_min, delta, polarity, r_open, r_close, min_intensity=min_intensity)
 
     if expected_n and expected_n > 0:
@@ -630,7 +615,7 @@ def read_digits_from_roi(bgr, expected_n=0, mode="auto", s_min=120, v_min=80,
             while i < len(decoded) and decoded[i] is None:
                 i += 1
             if i == len(decoded):
-                return None, mask, boxes, patterns_now  # all blank
+                return None, mask, boxes, patterns_now
             tail = decoded[i:]
             if any(d is None for d in tail):
                 return None, mask, boxes, patterns_now
@@ -705,6 +690,23 @@ def main():
     try: cv2.setUseOptimized(True)
     except Exception: pass
 
+    # --- preview scale helpers ---
+    def preview_scale_factor():
+        """Scale factor for preview windows when not using --resize WxH."""
+        return args.resize_scale if (args.resize_scale is not None) else float(args.display_scale)
+
+    def apply_preview_resize(img):
+        """Applies preview sizing for display/debug windows (not used for ROI selection frames)."""
+        if args.resize:
+            return cv2.resize(img, tuple(args.resize))
+        s = preview_scale_factor()
+        if abs(s - 1.0) > 1e-3:
+            return cv2.resize(
+                img, None, fx=s, fy=s,
+                interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+            )
+        return img
+
     cap = open_capture(args.video, args.backend)
     if not cap or not cap.isOpened():
         raise SystemExit(f"Could not open: {args.video}")
@@ -746,10 +748,13 @@ def main():
     if args.roi:
         roi = clamp_roi(selection_frame, tuple(args.roi))
     elif args.select_roi:
+        # --- IMPORTANT CHANGE ---
+        # selection preview scale now includes global preview scale too
+        sel_scale = float(args.roi_select_scale) * float(preview_scale_factor())
         pick = pick_roi_interactive(
             selection_frame,
             title="Select MAIN ROI (ENTER/SPACE=OK, C=Cancel)",
-            scale=args.roi_select_scale
+            scale=sel_scale
         )
         if pick: roi = clamp_roi(selection_frame, pick)
 
@@ -790,7 +795,12 @@ def main():
     if args.digits_roi:
         digits_roi = clamp_roi(preview_for_roi, tuple(args.digits_roi))
     elif args.select_digits_roi:
-        pick_led = pick_roi_interactive(preview_for_roi, title="Select DIGITS ROI (ENTER/SPACE=OK, C=Cancel)")
+        # optional: also scale this selection preview using global preview scale
+        pick_led = pick_roi_interactive(
+            preview_for_roi,
+            title="Select DIGITS ROI (ENTER/SPACE=OK, C=Cancel)",
+            scale=float(preview_scale_factor())
+        )
         if pick_led:
             digits_roi = clamp_roi(preview_for_roi, pick_led)
 
@@ -853,12 +863,12 @@ def main():
     last_val = None
     candidate_val = None
     candidate_count = 0
-    prev_digit_patterns = None  # list of per-slice bit patterns
+    prev_digit_patterns = None
 
     # ===== Cosine correction precompute =====
     cos_factor = 1.0
     if args.cam_distance and args.cam_distance > 0:
-        theta = math.atan2(abs(args.cam_offset), float(args.cam_distance))  # radians
+        theta = math.atan2(abs(args.cam_offset), float(args.cam_distance))
         c = math.cos(theta)
         if c <= 1e-9:
             print("[COS] Warning: angle too close to 90°, skipping correction.", file=sys.stderr)
@@ -900,7 +910,7 @@ def main():
                 if color_mask is not None:
                     mask_bin = cv2.bitwise_and(mask_bin, color_mask)
             weight = diff_used.astype(np.float32)
-        else:  # "brightest"
+        else:
             if args.blur and args.blur % 2 == 1 and args.blur > 1:
                 gray_proc = cv2.GaussianBlur(gray, (args.blur, args.blur), 0)
             else:
@@ -928,10 +938,9 @@ def main():
             cx_local = bx + bw / 2.0
             cy_local = by + bh / 2.0
 
-        # 7-seg reading (independent of main ROI)
+        # 7-seg reading
         if M_warp is not None:
-            warped = cv2.warpPerspective(frame, M_warp, warp_size)
-            img_for_digits = warped
+            img_for_digits = cv2.warpPerspective(frame, M_warp, warp_size)
         else:
             img_for_digits = frame
 
@@ -960,27 +969,21 @@ def main():
             seg_off_thresh=args.seg_off_thresh,
             seg_hyst=args.seg_hyst
         )
-        prev_digit_patterns = patterns_now  # persist hysteresis state
+        prev_digit_patterns = patterns_now
 
-        # Prepare 7-seg debug view if requested
+        # 7-seg debug view
         if args.show_digits and segmask is not None:
-            seg_debug = render_digits_debug(
-                segmask, dboxes, val,
-                seg_thresh=args.seg_thresh,
-                show_seg_boxes=args.show_seg_boxes
-            )
-            dbg = seg_debug
-            # Apply display scaling if no explicit --resize
-            if args.resize:
-                dbg = cv2.resize(dbg, tuple(args.resize))
-            elif abs(args.display_scale - 1.0) > 1e-3:
-                dbg = cv2.resize(dbg, None, fx=args.display_scale, fy=args.display_scale,
-                                 interpolation=cv2.INTER_AREA if args.display_scale < 1.0 else cv2.INTER_LINEAR)
-            else:
-                # fallback cap to ~420px width if huge
+            seg_debug = render_digits_debug(segmask, dboxes, val,
+                                            seg_thresh=args.seg_thresh,
+                                            show_seg_boxes=args.show_seg_boxes)
+            dbg = apply_preview_resize(seg_debug)
+
+            # fallback cap to ~420px width if huge and no resize/scale requested
+            if (not args.resize) and (args.resize_scale is None) and (abs(float(args.display_scale) - 1.0) <= 1e-3):
                 if dbg.shape[1] > 420:
                     scale = 420.0 / dbg.shape[1]
                     dbg = cv2.resize(dbg, (int(dbg.shape[1]*scale), int(dbg.shape[0]*scale)))
+
             cv2.imshow("7seg mask (tune me)", dbg)
 
         # Debounce + optional up-counter guard
@@ -998,8 +1001,6 @@ def main():
                         if proposed != last_val:
                             print(f"[7SEG] frame {frame_idx}: time_LED={proposed}")
                         last_val = proposed
-                    else:
-                        pass
                 else:
                     if proposed != last_val:
                         print(f"[7SEG] frame {frame_idx}: time_LED={proposed}")
@@ -1010,7 +1011,7 @@ def main():
         if math.isnan(cy_local):
             y_out = ""
         else:
-            raw_y = (roi_h - 1 - cy_local)  # bottom-left origin (pixels)
+            raw_y = (roi_h - 1 - cy_local)
             y_corr = raw_y * (cos_factor if (args.cam_distance and args.cam_distance > 0) else 1.0)
             y_out = f"{y_corr:.3f}"
 
@@ -1024,23 +1025,20 @@ def main():
         need_windows = args.display or args.show_filter or (writer is not None) or args.show_digits
         if need_windows:
             overlay = frame.copy()
-            # MAIN ROI box + tracked box
             cv2.rectangle(overlay, (x0, y0), (x0+w0, y0+h0), (0, 255, 255), 2)
             if box_local is not None:
+                bx, by, bw, bh = box_local
                 cv2.rectangle(overlay, (bx + x0, by + y0), (bx + x0 + bw, by + y0 + bh), (255, 0, 0), 2)
                 cv2.circle(overlay, (int(round(cx_local + x0)), int(round(cy_local + y0))), 3, (0,0,255), -1)
 
-            # Draw digits QUAD on overlay if used
             if M_warp is not None and digits_quad is not None:
                 pts = digits_quad.astype(np.int32)
                 cv2.polylines(overlay, [pts], isClosed=True, color=(0, 200, 0), thickness=2)
 
-            # DIGITS ROI rectangle on overlay (only if no quad; otherwise it’s in warped plane)
             if (M_warp is None) and (digits_roi is not None):
                 dx, dy, dw, dh = digits_roi
                 cv2.rectangle(overlay, (dx, dy), (dx+dw, dy+dh), (0, 200, 0), 2)
 
-            # HUD with LED reading + mode
             hud = f"frame={frame_idx} | mode={args.track_mode}"
             if last_val is not None:
                 hud += f" | time_LED={last_val}"
@@ -1055,23 +1053,14 @@ def main():
                 writer.write(overlay)
 
             if args.display:
-                disp = overlay
-                if args.resize:
-                    disp = cv2.resize(disp, tuple(args.resize))
-                elif abs(args.display_scale - 1.0) > 1e-3:
-                    disp = cv2.resize(disp, None, fx=args.display_scale, fy=args.display_scale,
-                                      interpolation=cv2.INTER_AREA if args.display_scale < 1.0 else cv2.INTER_LINEAR)
+                disp = apply_preview_resize(overlay)
                 cv2.imshow("Tracker + 7-seg Time", disp)
 
             if args.show_filter:
                 vis_roi = cv2.bitwise_and(view, view, mask=mask_bin)
                 filt_full = frame.copy()
                 filt_full[y0:y0+h0, x0:x0+w0] = vis_roi
-                if args.resize:
-                    filt_full = cv2.resize(filt_full, tuple(args.resize))
-                elif abs(args.display_scale - 1.0) > 1e-3:
-                    filt_full = cv2.resize(filt_full, None, fx=args.display_scale, fy=args.display_scale,
-                                           interpolation=cv2.INTER_AREA if args.display_scale < 1.0 else cv2.INTER_LINEAR)
+                filt_full = apply_preview_resize(filt_full)
                 cv2.imshow(f"Filtered mask [{args.track_mode}]", filt_full)
 
             if (args.display or args.show_filter or args.show_digits) and (cv2.waitKey(1) & 0xFF in (27, ord('q'))):
