@@ -59,6 +59,8 @@ def parse_args():
                    help="Four points (in ROTATED frame) around the display. Any order; auto-ordered TL,TR,BR,BL.")
     p.add_argument("--select-digits-quad", action="store_true",
                    help="Interactively click 4 corners of the digits display (in ROTATED frame).")
+    p.add_argument("--digits-quad-select-scale", type=float, default=1.0,
+                   help="Extra scale factor for DIGITS QUAD selection window only (multiplies preview scale).")
     p.add_argument("--digits-warp-size", type=int, nargs=2, metavar=("W","H"),
                    help="Output size (width height) for the perspective warp. If omitted, size is auto-estimated.")
 
@@ -229,7 +231,6 @@ def read_frame_at(cap, target_idx, allow_step=True):
             ok, f = cap.read()
             if ok:
                 return True, f, target_idx
-    # fallback: step from start
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     idx = 0
     while idx < target_idx:
@@ -274,9 +275,20 @@ def compute_perspective(quad, out_size=None):
     M = cv2.getPerspectiveTransform(quad, dst)
     return M, (W, H), quad
 
-def pick_quad_interactive(img, title="Click 4 corners (ENTER=OK, R=reset, C=cancel)"):
+def pick_quad_interactive(img, title="Click 4 corners (ENTER=OK, R=reset, C=cancel)", scale=1.0):
+    s = float(scale) if (scale and scale > 0) else 1.0
     pts = []
-    window = title
+    base_title = title
+
+    if abs(s - 1.0) > 1e-3:
+        disp = cv2.resize(
+            img, None, fx=s, fy=s,
+            interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+        )
+        window = f"{base_title} [scaled {s:.2f}x]"
+    else:
+        disp = img
+        window = base_title
 
     def cb(event, x, y, flags, param):
         nonlocal pts
@@ -289,13 +301,15 @@ def pick_quad_interactive(img, title="Click 4 corners (ENTER=OK, R=reset, C=canc
     cv2.setMouseCallback(window, cb)
 
     while True:
-        vis = img.copy()
+        vis = disp.copy()
         for i, (x, y) in enumerate(pts):
             cv2.circle(vis, (x, y), 4, (0, 255, 255), -1)
             cv2.putText(vis, f"{i+1}", (x+6, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
             cv2.putText(vis, f"{i+1}", (x+6, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
+
         if len(pts) >= 2:
             cv2.polylines(vis, [np.array(pts, dtype=np.int32)], isClosed=False, color=(0, 255, 255), thickness=2)
+
         cv2.putText(vis, "Click 4 corners of the digits display.", (8, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, "Click 4 corners of the digits display.", (8, 24),
@@ -304,107 +318,22 @@ def pick_quad_interactive(img, title="Click 4 corners (ENTER=OK, R=reset, C=canc
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
         cv2.putText(vis, "ENTER=OK  R=reset  C=cancel  Right-click=undo", (8, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,255,200), 1, cv2.LINE_AA)
+
         cv2.imshow(window, vis)
         k = cv2.waitKey(10) & 0xFF
+
         if k in (13, 10, 32) and len(pts) == 4:
             cv2.destroyWindow(window)
-            return order_quad(pts)
+            pts_arr = np.array(pts, dtype=np.float32)
+            if abs(s - 1.0) > 1e-3:
+                pts_arr /= s
+            return order_quad(pts_arr)
+
         elif k in (ord('r'), ord('R')):
             pts = []
         elif k in (ord('c'), ord('C'), 27):
             cv2.destroyWindow(window)
             return None
-
-# =========================
-# Background (MAIN ROI)
-# =========================
-def build_bg_median(cap, roi, warmup, rotate_mode="none"):
-    frames = []
-    pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-    for _ in range(max(1, warmup)):
-        ok, f = cap.read()
-        if not ok: break
-        f = rotate_frame(f, rotate_mode)
-        if roi:
-            x, y, w, h = roi
-            f = f[y:y+h, x:x+w]
-        frames.append(to_gray(f))
-    if not frames:
-        raise SystemExit("No frames gathered for median background.")
-    bg = np.median(np.stack(frames, 0), 0).astype(np.uint8)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
-    return bg.astype(np.float32)
-
-def init_bg_running(gray):
-    return gray.astype(np.float32)
-
-def update_bg_running(bg_f32, gray, alpha):
-    cv2.accumulateWeighted(gray, bg_f32, alpha)
-    return bg_f32
-
-# =========================
-# Motion / Brightest masks
-# =========================
-def motion_mask(gray, bg_uint8, blur_k=3, thr=0, r_open=1, r_close=1):
-    gray_proc = gray
-    bg_proc = bg_uint8
-    if blur_k and blur_k % 2 == 1 and blur_k > 1:
-        gray_proc = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
-        bg_proc   = cv2.GaussianBlur(bg_uint8, (blur_k, blur_k), 0)
-    diff = cv2.absdiff(gray_proc, bg_proc)
-    if thr <= 0:
-        _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    else:
-        _, mask = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
-    if r_open > 0:
-        k = 1 + 2*r_open
-        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker, 1)
-    if r_close > 0:
-        k = 1 + 2*r_close
-        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, 1)
-    return mask, diff, gray_proc
-
-def brightest_mask(gray_proc, min_intensity=0, bright_thresh=0, r_open=1, r_close=1):
-    if bright_thresh > 0:
-        _, thr = cv2.threshold(gray_proc, int(bright_thresh), 255, cv2.THRESH_BINARY)
-    else:
-        _, thr = cv2.threshold(gray_proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    if min_intensity > 0:
-        gate = (gray_proc >= np.uint8(min_intensity)).astype(np.uint8) * 255
-        m = cv2.bitwise_and(thr, gate)
-    else:
-        m = thr
-
-    if r_open > 0:
-        k = 1 + 2*r_open
-        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker, 1)
-    if r_close > 0:
-        k = 1 + 2*r_close
-        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker, 1)
-
-    return m
-
-# =========================
-# Color helpers (HSV) for MAIN ROI preference
-# =========================
-def color_mask_hsv(bgr, which: str, s_min: int, v_min: int):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    s_min_u8 = np.uint8(np.clip(s_min, 0, 255))
-    v_min_u8 = np.uint8(np.clip(v_min, 0, 255))
-    if which == "blue":
-        return cv2.inRange(hsv, np.array([90,  s_min_u8, v_min_u8]), np.array([140, 255, 255]))
-    if which == "green":
-        return cv2.inRange(hsv, np.array([35,  s_min_u8, v_min_u8]), np.array([85,  255, 255]))
-    if which == "red":
-        m1 = cv2.inRange(hsv, np.array([0,   s_min_u8, v_min_u8]), np.array([10,  255, 255]))
-        m2 = cv2.inRange(hsv, np.array([160, s_min_u8, v_min_u8]), np.array([179, 255, 255]))
-        return cv2.bitwise_or(m1, m2)
-    return None
 
 # =========================
 # 7-seg decoder with hysteresis
@@ -504,13 +433,13 @@ def get_seg_boxes(W, H):
     yT = int(H * 0.05); yB = int(H * 0.95)
     yU = int(H * 0.20); yM = int(H * 0.50); yD = int(H * 0.80)
     return {
-        0: (xMl, max(0, yT), max(1, xMr - xMl), max(1, int(H*0.12))),                 # a
-        1: (xMr, yU, max(1, W - xMr), max(1, yM - yU)),                                # b
-        2: (xMr, yM, max(1, W - xMr), max(1, yD - yM)),                                # c
-        3: (xMl, min(yB - int(H*0.12), yD), max(1, xMr - xMl), max(1, int(H*0.12))),  # d
-        4: (0,   yM, max(1, xMl), max(1, yD - yM)),                                    # e
-        5: (0,   yU, max(1, xMl), max(1, yM - yU)),                                    # f
-        6: (xMl, max(0, int(yM - H*0.06)), max(1, xMr - xMl), max(1, int(H*0.12))),    # g
+        0: (xMl, max(0, yT), max(1, xMr - xMl), max(1, int(H*0.12))),
+        1: (xMr, yU, max(1, W - xMr), max(1, yM - yU)),
+        2: (xMr, yM, max(1, W - xMr), max(1, yD - yM)),
+        3: (xMl, min(yB - int(H*0.12), yD), max(1, xMr - xMl), max(1, int(H*0.12))),
+        4: (0,   yM, max(1, xMl), max(1, yD - yM)),
+        5: (0,   yU, max(1, xMl), max(1, yM - yU)),
+        6: (xMl, max(0, int(yM - H*0.06)), max(1, xMr - xMl), max(1, int(H*0.12))),
     }
 
 def segments_from_digit(mask_digit, on_thresh=0.40, off_thresh=None, prev_pattern=None):
@@ -564,18 +493,11 @@ def read_digits_from_roi(bgr, expected_n=0, mode="auto", s_min=120, v_min=80,
                          prev_patterns=None, seg_off_thresh=None, seg_hyst=0.10):
     mask = hsv_mask_for_digits(bgr, mode, s_min, v_min, delta, polarity, r_open, r_close, min_intensity=min_intensity)
 
-    if expected_n and expected_n > 0:
-        boxes = split_digits(mask, expected_n=expected_n,
-                             split_thresh_frac=split_thresh_frac,
-                             margin_frac=margin_frac)
-        if not boxes:
-            return None, mask, [], prev_patterns
-    else:
-        boxes = split_digits(mask, expected_n=0,
-                             split_thresh_frac=split_thresh_frac,
-                             margin_frac=margin_frac)
-        if not boxes:
-            return None, mask, [], prev_patterns
+    boxes = split_digits(mask, expected_n=expected_n,
+                         split_thresh_frac=split_thresh_frac,
+                         margin_frac=margin_frac)
+    if not boxes:
+        return None, mask, [], prev_patterns
 
     if seg_off_thresh is None:
         seg_off_thresh = float(seg_on_thresh) - float(seg_hyst)
@@ -655,6 +577,93 @@ def render_digits_debug(mask, boxes, value, seg_thresh=0.40, show_seg_boxes=Fals
     return vis
 
 # =========================
+# Background (MAIN ROI)
+# =========================
+def build_bg_median(cap, roi, warmup, rotate_mode="none"):
+    frames = []
+    pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    for _ in range(max(1, warmup)):
+        ok, f = cap.read()
+        if not ok: break
+        f = rotate_frame(f, rotate_mode)
+        if roi:
+            x, y, w, h = roi
+            f = f[y:y+h, x:x+w]
+        frames.append(to_gray(f))
+    if not frames:
+        raise SystemExit("No frames gathered for median background.")
+    bg = np.median(np.stack(frames, 0), 0).astype(np.uint8)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+    return bg.astype(np.float32)
+
+def init_bg_running(gray):
+    return gray.astype(np.float32)
+
+# =========================
+# Motion / Brightest masks
+# =========================
+def motion_mask(gray, bg_uint8, blur_k=3, thr=0, r_open=1, r_close=1):
+    gray_proc = gray
+    bg_proc = bg_uint8
+    if blur_k and blur_k % 2 == 1 and blur_k > 1:
+        gray_proc = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+        bg_proc   = cv2.GaussianBlur(bg_uint8, (blur_k, blur_k), 0)
+    diff = cv2.absdiff(gray_proc, bg_proc)
+    if thr <= 0:
+        _, mask = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        _, mask = cv2.threshold(diff, thr, 255, cv2.THRESH_BINARY)
+    if r_open > 0:
+        k = 1 + 2*r_open
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ker, 1)
+    if r_close > 0:
+        k = 1 + 2*r_close
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ker, 1)
+    return mask, diff, gray_proc
+
+def brightest_mask(gray_proc, min_intensity=0, bright_thresh=0, r_open=1, r_close=1):
+    if bright_thresh > 0:
+        _, thr = cv2.threshold(gray_proc, int(bright_thresh), 255, cv2.THRESH_BINARY)
+    else:
+        _, thr = cv2.threshold(gray_proc, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if min_intensity > 0:
+        gate = (gray_proc >= np.uint8(min_intensity)).astype(np.uint8) * 255
+        m = cv2.bitwise_and(thr, gate)
+    else:
+        m = thr
+
+    if r_open > 0:
+        k = 1 + 2*r_open
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ker, 1)
+    if r_close > 0:
+        k = 1 + 2*r_close
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, ker, 1)
+
+    return m
+
+# =========================
+# Color helpers (HSV) for MAIN ROI preference
+# =========================
+def color_mask_hsv(bgr, which: str, s_min: int, v_min: int):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    s_min_u8 = np.uint8(np.clip(s_min, 0, 255))
+    v_min_u8 = np.uint8(np.clip(v_min, 0, 255))
+    if which == "blue":
+        return cv2.inRange(hsv, np.array([90,  s_min_u8, v_min_u8]), np.array([140, 255, 255]))
+    if which == "green":
+        return cv2.inRange(hsv, np.array([35,  s_min_u8, v_min_u8]), np.array([85,  255, 255]))
+    if which == "red":
+        m1 = cv2.inRange(hsv, np.array([0,   s_min_u8, v_min_u8]), np.array([10,  255, 255]))
+        m2 = cv2.inRange(hsv, np.array([160, s_min_u8, v_min_u8]), np.array([179, 255, 255]))
+        return cv2.bitwise_or(m1, m2)
+    return None
+
+# =========================
 # Component picker
 # =========================
 def pick_brightest_component(mask_bin, diff_or_gray, bright_mask=None, weight=None):
@@ -692,11 +701,9 @@ def main():
 
     # --- preview scale helpers ---
     def preview_scale_factor():
-        """Scale factor for preview windows when not using --resize WxH."""
         return args.resize_scale if (args.resize_scale is not None) else float(args.display_scale)
 
     def apply_preview_resize(img):
-        """Applies preview sizing for display/debug windows (not used for ROI selection frames)."""
         if args.resize:
             return cv2.resize(img, tuple(args.resize))
         s = preview_scale_factor()
@@ -711,7 +718,6 @@ def main():
     if not cap or not cap.isOpened():
         raise SystemExit(f"Could not open: {args.video}")
 
-    # FPS used for selection timestamp and HUD display
     vid_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
 
     # ==== Pick a frame for selections ====
@@ -739,7 +745,6 @@ def main():
             raise SystemExit("Failed to read any frame from source.")
         selection_frame = first
 
-    # Rotate selection frame for interactive picks
     selection_frame = rotate_frame(selection_frame, args.rotate)
     H_full, W_full = selection_frame.shape[:2]
 
@@ -748,8 +753,6 @@ def main():
     if args.roi:
         roi = clamp_roi(selection_frame, tuple(args.roi))
     elif args.select_roi:
-        # --- IMPORTANT CHANGE ---
-        # selection preview scale now includes global preview scale too
         sel_scale = float(args.roi_select_scale) * float(preview_scale_factor())
         pick = pick_roi_interactive(
             selection_frame,
@@ -771,7 +774,12 @@ def main():
         pts = np.array(args.digits_quad, dtype=np.float32).reshape(4,2)
         digits_quad = order_quad(pts)
     elif args.select_digits_quad:
-        q = pick_quad_interactive(selection_frame, title="Select DIGITS QUAD (ENTER=OK, R=reset, C=cancel)")
+        quad_scale = float(preview_scale_factor()) * float(args.digits_quad_select_scale)
+        q = pick_quad_interactive(
+            selection_frame,
+            title="Select DIGITS QUAD (ENTER=OK, R=reset, C=cancel)",
+            scale=quad_scale
+        )
         if q is not None:
             digits_quad = q
 
@@ -795,7 +803,6 @@ def main():
     if args.digits_roi:
         digits_roi = clamp_roi(preview_for_roi, tuple(args.digits_roi))
     elif args.select_digits_roi:
-        # optional: also scale this selection preview using global preview scale
         pick_led = pick_roi_interactive(
             preview_for_roi,
             title="Select DIGITS ROI (ENTER/SPACE=OK, C=Cancel)",
@@ -820,7 +827,6 @@ def main():
     # Rewind for processing
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    # FPS for overlay only
     use_fps = args.fps if args.fps > 0 else (vid_fps if vid_fps and vid_fps > 0 else 30.0)
 
     # Background for MAIN ROI
@@ -878,11 +884,9 @@ def main():
         print(f"[COS] cam_distance={args.cam_distance} m, cam_offset={args.cam_offset} m, "
               f"theta={math.degrees(theta):.3f} deg, factor={cos_factor:.6f}")
 
-    # Prepare a resizable debug window for 7-seg if requested
     if args.show_digits:
         cv2.namedWindow("7seg mask (tune me)", cv2.WINDOW_NORMAL)
 
-    # Main loop
     frame_idx = 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     proc_start = time.perf_counter()
@@ -892,12 +896,10 @@ def main():
         if not ok: break
         frame = rotate_frame(frame, args.rotate)
 
-        # MAIN ROI view
         view = frame[y0:y0+h0, x0:x0+w0]
         roi_h = h0
         gray = to_gray(view)
 
-        # Build masks depending on tracking mode
         if args.track_mode == "motion":
             mask_bin, diff_used, gray_proc = motion_mask(
                 gray, bg_f32.astype(np.uint8), blur_k=args.blur, thr=args.thresh, r_open=args.open, r_close=args.close
@@ -929,7 +931,6 @@ def main():
             weight = gray_proc.astype(np.float32)
             diff_used = gray_proc
 
-        # Pick component
         box_local, _ = pick_brightest_component(mask_bin, diff_used, bright_mask=None, weight=weight)
 
         cx_local = cy_local = math.nan
@@ -938,7 +939,6 @@ def main():
             cx_local = bx + bw / 2.0
             cy_local = by + bh / 2.0
 
-        # 7-seg reading
         if M_warp is not None:
             img_for_digits = cv2.warpPerspective(frame, M_warp, warp_size)
         else:
@@ -971,14 +971,12 @@ def main():
         )
         prev_digit_patterns = patterns_now
 
-        # 7-seg debug view
         if args.show_digits and segmask is not None:
             seg_debug = render_digits_debug(segmask, dboxes, val,
                                             seg_thresh=args.seg_thresh,
                                             show_seg_boxes=args.show_seg_boxes)
             dbg = apply_preview_resize(seg_debug)
 
-            # fallback cap to ~420px width if huge and no resize/scale requested
             if (not args.resize) and (args.resize_scale is None) and (abs(float(args.display_scale) - 1.0) <= 1e-3):
                 if dbg.shape[1] > 420:
                     scale = 420.0 / dbg.shape[1]
@@ -986,7 +984,6 @@ def main():
 
             cv2.imshow("7seg mask (tune me)", dbg)
 
-        # Debounce + optional up-counter guard
         if val is not None:
             if candidate_val == val:
                 candidate_count += 1
@@ -1006,7 +1003,6 @@ def main():
                         print(f"[7SEG] frame {frame_idx}: time_LED={proposed}")
                     last_val = proposed
 
-        # CSV write (origin bottom-left of ROI)
         time_led_str = str(int(last_val)) if last_val is not None else ""
         if math.isnan(cy_local):
             y_out = ""
@@ -1021,7 +1017,6 @@ def main():
             y_out
         ])
 
-        # Overlays / output
         need_windows = args.display or args.show_filter or (writer is not None) or args.show_digits
         if need_windows:
             overlay = frame.copy()
@@ -1068,12 +1063,10 @@ def main():
 
         frame_idx += 1
 
-    # Timing summary
     elapsed = time.perf_counter() - proc_start
     eff_fps = (frame_idx / elapsed) if elapsed > 0 else float("inf")
     print(f"[DONE] Processed {frame_idx} frames in {elapsed:.3f} s ({eff_fps:.1f} FPS).", flush=True)
 
-    # Cleanup
     cap.release()
     if writer:
         writer.release()
