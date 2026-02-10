@@ -1,1 +1,0 @@
-# pulsator-pumping-power
