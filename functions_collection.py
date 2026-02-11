@@ -230,8 +230,8 @@ def plotdata(df_vel,df_P,df_power,avg_power_Wm3,flowlim,presslim,powerlim,plot_v
     # print("Flow amp: ",vel_peak2peak)
     
     if plot_vel_peak == True and plotgraph == True:        
-        ax1.scatter(time_peak_vel, vel_peak, color="red", marker="o", s=30, label="Peaks")
-        ax1.scatter(time_crest_vel, vel_crest, color="red", marker="o", s=30, label="Peaks")
+        ax1.scatter(time_peak_vel-0.5, vel_peak, color="red", marker="o", s=30, label="Peaks")
+        ax1.scatter(time_crest_vel-0.5, vel_crest, color="red", marker="o", s=30, label="Peaks")
         
     peak_mask_pressure = df_P["peak"] == 1
     time_peak_pressure = df_P.loc[peak_mask_pressure, "time(s)"]
@@ -243,8 +243,8 @@ def plotdata(df_vel,df_P,df_power,avg_power_Wm3,flowlim,presslim,powerlim,plot_v
     # print("Pressure amp: ",press_peak2peak) 
     
     if plot_pressure_peak == True:        
-        ax2.scatter(time_peak_pressure, pressure_peak/1000, color="blue", marker="s", s=30, label="Peaks")
-        ax2.scatter(time_crest_pressure, pressure_crest/1000, color="blue", marker="s", s=30, label="Peaks")
+        ax2.scatter(time_peak_pressure-0.5, pressure_peak/1000, color="blue", marker="s", s=30, label="Peaks")
+        ax2.scatter(time_crest_pressure-0.5, pressure_crest/1000, color="blue", marker="s", s=30, label="Peaks")
 
     
     return vel_peak2peak,press_peak2peak
