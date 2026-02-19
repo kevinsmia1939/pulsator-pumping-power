@@ -1,11 +1,78 @@
 # Full GUI with Buffered Logging + Plotting + Controls + Text Display (Updated)
 
-import sys, os, csv
+import sys, os, csv, argparse
 from datetime import datetime
 from queue import Queue
 from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 import serial
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Serial pressure logger with GUI and headless modes")
+    parser.add_argument("--headless", action="store_true", help="Run without launching the GUI")
+    parser.add_argument("--port", default="/dev/ttyACM0", help="Serial port/device path")
+    parser.add_argument("--baud", type=int, default=1000000, help="Serial baud rate")
+    parser.add_argument(
+        "--csv",
+        default=f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        help="Path to output CSV file",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=0,
+        help="Maximum number of rows to log in headless mode (0 = unlimited)",
+    )
+    return parser.parse_args(argv)
+
+
+def run_headless(port: str, baud: int, csv_path: str, max_rows: int = 0):
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    row_count = 0
+    header_written = False
+    csv_file = None
+    ser = None
+
+    try:
+        csv_file = open(csv_path, "w", newline="")
+        writer = csv.writer(csv_file)
+        ser = serial.Serial(port, baud, timeout=1)
+        ser.reset_input_buffer()
+
+        print(f"[headless] Logging {port} @ {baud} to {csv_path}")
+        print("[headless] Press Ctrl+C to stop.")
+
+        while True:
+            raw = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not raw:
+                continue
+            try:
+                row = [float(x) for x in raw.split(",")]
+            except ValueError:
+                continue
+
+            if not header_written:
+                writer.writerow([f"S{i+1}" for i in range(len(row))])
+                header_written = True
+
+            writer.writerow(row)
+            row_count += 1
+
+            if row_count % 100 == 0:
+                csv_file.flush()
+
+            if max_rows > 0 and row_count >= max_rows:
+                print(f"[headless] Reached max rows: {max_rows}")
+                break
+    except KeyboardInterrupt:
+        print("\n[headless] Stopped by user.")
+    finally:
+        if csv_file:
+            csv_file.flush()
+            csv_file.close()
+        if ser and ser.is_open:
+            ser.close()
 
 class SerialReader(QtCore.QThread):
     data_row = QtCore.pyqtSignal(list)
@@ -48,7 +115,7 @@ class SerialReader(QtCore.QThread):
 
 
 class SerialLoggerPlotter(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, default_port="/dev/ttyACM0", default_baud="1000000", default_csv_path=None):
         super().__init__()
         self.setWindowTitle("Buffered Serial Logger + Live Plotter")
         self.resize(1300, 700)
@@ -68,7 +135,10 @@ class SerialLoggerPlotter(QtWidgets.QMainWindow):
         self.worker = None
         self.num_series = 0
 
-        self._build_ui()
+        if default_csv_path is None:
+            default_csv_path = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        self._build_ui(default_port, str(default_baud), default_csv_path)
 
         self.flush_timer = QtCore.QTimer()
         self.flush_timer.setInterval(50)
@@ -78,7 +148,7 @@ class SerialLoggerPlotter(QtWidgets.QMainWindow):
         self.label_update_timer.setInterval(500)  # update every 500 ms
         self.label_update_timer.timeout.connect(self._update_value_labels)
 
-    def _build_ui(self):
+    def _build_ui(self, default_port: str, default_baud: str, default_csv_path: str):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
@@ -90,7 +160,7 @@ class SerialLoggerPlotter(QtWidgets.QMainWindow):
         self.plot.addLegend()
         layout.addWidget(self.plot, 4)
 
-        self.port_edit = QtWidgets.QLineEdit("/dev/ttyACM0")
+        self.port_edit = QtWidgets.QLineEdit(default_port)
 
         self.baud_combo = QtWidgets.QComboBox()
         common_bauds = [
@@ -101,14 +171,14 @@ class SerialLoggerPlotter(QtWidgets.QMainWindow):
         ]
         self.baud_combo.addItems(common_bauds)
         self.baud_combo.setEditable(True)
-        self.baud_combo.setCurrentText("1000000")
+        self.baud_combo.setCurrentText(default_baud)
 
         self.sample_spin = QtWidgets.QSpinBox()
         self.sample_spin.setRange(10, 1000000)
         self.sample_spin.setValue(self.max_samples)
         self.sample_spin.valueChanged.connect(self._update_sample_size)
 
-        self.csv_edit = QtWidgets.QLineEdit(f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        self.csv_edit = QtWidgets.QLineEdit(default_csv_path)
         btn_browse = QtWidgets.QPushButton("Browse")
         btn_browse.clicked.connect(self._browse_csv)
 
@@ -277,9 +347,19 @@ class SerialLoggerPlotter(QtWidgets.QMainWindow):
         event.accept()
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    win = SerialLoggerPlotter()
+def main(argv=None):
+    args = parse_args(argv)
+
+    if args.headless:
+        run_headless(port=args.port, baud=args.baud, csv_path=args.csv, max_rows=args.max_rows)
+        return
+
+    app = QtWidgets.QApplication([sys.argv[0]])
+    win = SerialLoggerPlotter(
+        default_port=args.port,
+        default_baud=str(args.baud),
+        default_csv_path=args.csv,
+    )
     win.show()
     sys.exit(app.exec_())
 
