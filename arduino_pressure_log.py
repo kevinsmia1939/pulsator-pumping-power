@@ -11,11 +11,16 @@ import serial
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Serial pressure logger with GUI and headless modes")
     parser.add_argument("--headless", action="store_true", help="Run without launching the GUI")
+    parser.add_argument(
+        "--start-logging",
+        action="store_true",
+        help="Immediately start logging when the GUI launches (requires --csv)",
+    )
     parser.add_argument("--port", default="/dev/ttyACM0", help="Serial port/device path")
     parser.add_argument("--baud", type=int, default=1000000, help="Serial baud rate")
     parser.add_argument(
         "--csv",
-        default=f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        default=None,
         help="Path to output CSV file",
     )
     parser.add_argument(
@@ -24,7 +29,15 @@ def parse_args(argv=None):
         default=0,
         help="Maximum number of rows to log in headless mode (0 = unlimited)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.start_logging and args.csv is None:
+        parser.error("--start-logging requires an explicit --csv path")
+
+    if args.csv is None:
+        args.csv = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+    return args
 
 
 def run_headless(port: str, baud: int, csv_path: str, max_rows: int = 0):
@@ -361,6 +374,8 @@ def main(argv=None):
         default_csv_path=args.csv,
     )
     win.show()
+    if args.start_logging:
+        QtCore.QTimer.singleShot(0, win.start_logging)
     sys.exit(app.exec_())
 
 
